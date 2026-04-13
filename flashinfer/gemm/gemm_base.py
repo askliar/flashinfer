@@ -58,7 +58,6 @@ from ..jit.gemm import gen_gemm_sm100_module_cutlass_bf16
 from ..jit.gemm import gen_trtllm_gen_gemm_module
 from ..jit.gemm import gen_tgv_gemm_sm10x_module
 from ..jit.gemm import gen_deepgemm_sm100_module
-from ..jit.cpp_ext import get_cuda_version
 from ..jit.gemm import gen_fp8_blockscale_gemm_sm90_module
 from ..tllm_enums import DtypeTrtllmGen, SfLayout
 
@@ -4804,38 +4803,12 @@ def _heuristic_func_mm_fp4(
     enable_pdl: bool = True,  # unused
 ):
     r"""
-    Heuristic function for mm_fp4 backend selection. Routes to either cudnn or cutlass.
-    Note: trtllm is not considered in the backend selection because it requires a specific
-    input quantization (swizzling/shuffling) that differs from the preparation used
-    for cudnn and cutlass backends.
+    Heuristic for ``backend="auto"``: use cuDNN only when it passes requirement checks.
 
-    Logic for which comes first:
-    - If cuda version is 12 - use cutlass.
-    - If cuda version is 13 and cudnn version is less than 9.15 - use cutlass.
-    - If cuda version is 13 and cudnn version is 9.15 or greater:
-      - On SM103 (B300) - use cutlass (faster based on benchmarks).
-      - On SM100 (B200) - use cudnn (faster based on benchmarks).
-
+    ``trtllm`` and ``cute-dsl`` are not included because they need different weight prep.
+    Use ``backend="cutlass"`` (or another backend) explicitly when cuDNN is not suitable.
     """
-    cuda_major = get_cuda_version().major
-    # Get compute capability to distinguish between SM100 (10.0) and SM103 (10.3)
-    major, minor = get_compute_capability(a.device)
-    is_sm103 = major == 10 and minor == 3
-
-    # If cuda version is 13 or greater and cudnn version is 9.15 or greater:
-    # On SM103 (B300), cutlass is more performant than cudnn.
-    # On SM100 (B200), cudnn is more performant than cutlass.
-    if CUDNN_AVAILABLE and cuda_major >= 13 and cudnn.backend_version() >= 91500:
-        if is_sm103:
-            candidate_backends = ("cutlass", "cudnn")
-        else:
-            candidate_backends = ("cudnn", "cutlass")
-    # Otherwise, prioritize cutlass
-    else:
-        candidate_backends = ("cutlass", "cudnn")
-
-    # Filter and return only supported backends
-    return [c for c in candidate_backends if c in suitable_backends]
+    return [b for b in ("cudnn",) if b in suitable_backends]
 
 
 def _pad_up(x, y):
@@ -4957,7 +4930,7 @@ def mm_fp4(
     out: Optional[torch.Tensor] = None,
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,
-    backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "auto"] = "auto",
+    backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "auto"] = "cudnn",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,
 ) -> torch.Tensor:
@@ -4993,10 +4966,10 @@ def mm_fp4(
         Whether to use 8x4 scale factor layout or 128x4 scale factor layout, defaults to False.
 
     backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "auto"]
-        Backend to use, defaults to ``"auto"``, which automatically selects the best
-        backend between ``"cudnn"`` and ``"cutlass"`` based on the current CUDA and
-        cuDNN versions. The ``"trtllm"`` and ``"cute-dsl"`` backends are never selected
-        when ``backend="auto"`` because they require different weight preparation.
+        Backend to use, defaults to ``"cudnn"``. ``"auto"`` is equivalent to cuDNN when
+        the cuDNN requirement checks pass; otherwise use ``"cutlass"`` or another
+        backend explicitly. The ``"trtllm"`` and ``"cute-dsl"`` backends are never
+        selected for ``backend="auto"``.
 
     use_nvfp4: bool
         Whether to use nvfp4 quantization or mxfp4 quantization, defaults to ``True``.
@@ -5047,13 +5020,13 @@ def mm_fp4(
         "mm_fp4_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
 
-    # Auto-select the best backend
+    # ``backend="auto"`` resolves to cuDNN-only via ``suitable_auto_backends``.
     if backend == "auto":
         backends = mm_fp4.suitable_auto_backends
     else:
         backends = [backend]
 
-    # At this point, backends contains a supported backend if specified, or all supported backends if backend='auto'.
+    # ``backends`` is a single explicit backend, or ``["cudnn"]`` when ``backend="auto"``.
     # Lazy initialization of runners to avoid overhead of creating a new runner that will not be used
     major, minor = get_compute_capability(a.device)
 
