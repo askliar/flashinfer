@@ -567,7 +567,6 @@ class AutoTuner:
         self.repeat = repeat
         self.warmup = warmup
         self.stream_delay_micro_secs = stream_delay_micro_secs
-        # Keys from _get_cache_key; values are (runner_id, tactic, opt_profile).
         self.profiling_cache: Dict[Tuple[Any, ...], Tuple[int, Any, Any]] = {}
         self.is_tuning_mode = False
         self._active_tuning_contexts = 0
