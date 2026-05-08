@@ -61,11 +61,12 @@ def b12x_fused_moe(
     *,
     w1_alpha: torch.Tensor,
     w2_alpha: torch.Tensor,
-    fc2_input_scale: torch.Tensor,
+    fc2_input_scale: Optional[torch.Tensor] = None,
     num_local_experts: Optional[int] = None,
     output: Optional[torch.Tensor] = None,
     output_dtype: torch.dtype = torch.bfloat16,
     activation: str = "silu",
+    activation_precision: str = "fp4",
 ) -> torch.Tensor:
     """Run fused MoE on SM120/SM121 using b12x CuTe DSL kernels.
 
@@ -88,13 +89,17 @@ def b12x_fused_moe(
         top_k: Number of experts per token.
         w1_alpha: Per-expert global scale for FC1.
         w2_alpha: Per-expert global scale for FC2.
-        fc2_input_scale: Global scale for FC2 input quantization.
+        fc2_input_scale: Global scale for FC2 input quantization. Required for
+            activation_precision="fp4"; accepted but ignored for
+            activation_precision="bf16".
         num_local_experts: Local experts for EP. Default: num_experts.
         output: Pre-allocated output buffer [num_tokens, hidden_size], bf16.
         output_dtype: Output data type. Only torch.bfloat16 is currently
             supported. Default: torch.bfloat16.
         activation: Activation function — "silu" (gated/SwiGLU) or
             "relu2" (non-gated/Nemotron-Super). Default: "silu".
+        activation_precision: Intermediate activation precision: "fp4" for
+            W4A4, or "bf16" for W4A16. Default: "fp4".
 
     Returns:
         Output tensor [num_tokens, hidden_size].
@@ -152,6 +157,7 @@ def b12x_fused_moe(
         num_local_experts=num_local_experts,
         scatter_output=output,
         activation=activation,
+        activation_precision=activation_precision,
     )
 
 
@@ -173,6 +179,8 @@ class B12xMoEWrapper:
             supported. Default: torch.bfloat16.
         device: Device for buffer allocation. Default: "cuda".
         activation: Activation function — "silu" or "relu2". Default: "silu".
+        activation_precision: Intermediate activation precision, "fp4" (W4A4)
+            or "bf16" (W4A16). Default: "fp4".
 
     Example:
         >>> moe = B12xMoEWrapper(num_experts=256, top_k=8, ...)
@@ -194,8 +202,10 @@ class B12xMoEWrapper:
         output_dtype: torch.dtype = torch.bfloat16,
         device: str = "cuda",
         activation: str = "silu",
+        activation_precision: str = "fp4",
     ):
         from ...jit.cpp_ext import get_cuda_version
+        from .blackwell_sm12x.moe_dispatch import _normalize_activation_precision
 
         if get_cuda_version().major < 13:
             raise ValueError(
@@ -220,6 +230,9 @@ class B12xMoEWrapper:
         self.output_dtype = output_dtype
         self.device = device
         self.activation = activation
+        self.activation_precision = _normalize_activation_precision(
+            activation_precision
+        )
 
         # Pre-allocated objects. Both workspace slots may be populated so
         # run() can pick per-call; without this, the backend would be locked
@@ -273,6 +286,7 @@ class B12xMoEWrapper:
             n=self.intermediate_size,
             num_topk=self.top_k,
             device=torch.device(self.device),
+            activation_precision=self.activation_precision,
         )
 
         if needs_dynamic:
@@ -284,6 +298,7 @@ class B12xMoEWrapper:
                 n=self.intermediate_size,
                 num_topk=self.top_k,
                 device=torch.device(self.device),
+                activation_precision=self.activation_precision,
             )
 
         # Allocated after arch-specific buffers to preserve memory layout
@@ -307,7 +322,7 @@ class B12xMoEWrapper:
         *,
         w1_alpha: torch.Tensor,
         w2_alpha: torch.Tensor,
-        fc2_input_scale: torch.Tensor,
+        fc2_input_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run MoE computation.
 
@@ -321,7 +336,8 @@ class B12xMoEWrapper:
             token_final_scales: Routing weights [num_tokens, top_k].
             w1_alpha: Per-expert global scale for FC1.
             w2_alpha: Per-expert global scale for FC2.
-            fc2_input_scale: Global scale for FC2 input quantization.
+            fc2_input_scale: Global scale for FC2 input quantization. Required
+                for activation_precision="fp4"; accepted but ignored for "bf16".
 
         Returns:
             Output tensor [num_tokens, hidden_size].
@@ -365,6 +381,7 @@ class B12xMoEWrapper:
 
         # Cache weight views; invalidate if weight pointers change.
         weight_key = (
+            self.activation_precision,
             w1_weight.data_ptr(),
             w1_weight_sf.data_ptr(),
             w1_alpha.data_ptr(),
@@ -382,6 +399,7 @@ class B12xMoEWrapper:
                 w2_alphas=w2_alpha,
                 n=self.intermediate_size,
                 k=self.hidden_size,
+                activation_precision=self.activation_precision,
             )
             self._weight_key = weight_key
 
@@ -401,6 +419,7 @@ class B12xMoEWrapper:
             num_local_experts=self.num_local_experts,
             scatter_output=moe_output,
             activation=self.activation,
+            activation_precision=self.activation_precision,
             _workspace=workspace,
             _weight_views=self._weight_views,
         )
