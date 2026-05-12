@@ -401,9 +401,23 @@ def convert_sf_from_mma_layout(
     Returns:
         Scale factors in 2D swizzled layout: `(num_groups * M_padded, K_padded/sf_vec_size)`.
     """
-    sf_k = ceil_div(k, sf_vec_size)
-    m_tiles = ceil_div(m, 128)
-    k_tiles = ceil_div(sf_k, 4)
+    # Source-of-truth m_tiles and k_tiles come from the storage shape,
+    # not from recomputing via (m, k). Some upstream allocators pad K to
+    # 128 (yielding k_tiles = ceil_div(k, 64)) instead of to 64 (giving
+    # ceil_div(ceil_div(k, sf_vec_size), 4)) — when those disagree, the
+    # reshape would fail with a size mismatch (e.g. Nemotron-Nano3.5
+    # down_proj at m=2688, k=1856 has 30 storage k_tiles vs 29 computed).
+    # The (m, k) arguments are still useful for validation only.
+    m_tiles = int(sf_6d.shape[2])
+    k_tiles = int(sf_6d.shape[4])
+    expected_m_tiles = ceil_div(m, 128)
+    expected_k_tiles_min = ceil_div(ceil_div(k, sf_vec_size), 4)
+    if m_tiles < expected_m_tiles or k_tiles < expected_k_tiles_min:
+        raise ValueError(
+            f"sf_6d storage has m_tiles={m_tiles}, k_tiles={k_tiles} "
+            f"but matrix dims (m={m}, k={k}) require at least "
+            f"m_tiles={expected_m_tiles}, k_tiles={expected_k_tiles_min}."
+        )
 
     # Permute from MMA logical order back to storage order
     # From: (32, 4, m_tiles, 4, k_tiles, num_groups)

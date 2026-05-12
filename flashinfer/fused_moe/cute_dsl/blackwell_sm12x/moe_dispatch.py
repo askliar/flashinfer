@@ -1460,6 +1460,7 @@ def launch_sm120_static_moe(
         scatter_output,
         workspace.token_map,
         workspace.token_weights,
+        mac,  # b12x patch: static max_active_clusters runtime (FI 0.6.11)
     )
     compiled(*runtime_args, current_cuda_stream())
 
@@ -2149,6 +2150,7 @@ def launch_sm120_dynamic_moe(
         workspace.physical_tiles_capacity * _level_tile_m(activation_precision),
         workspace.task_capacity,
         workspace.physical_tiles_capacity,
+        mac,  # b12x patch: max_active_clusters runtime (FI 0.6.11 Constexpr bake-out broken)
     )
     compiled(*runtime_args, current_cuda_stream())
 

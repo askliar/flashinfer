@@ -192,3 +192,20 @@ from .xqa import xqa as xqa
 from .xqa import xqa_mla as xqa_mla
 from . import mamba as mamba
 from .fi_trace import fi_trace as fi_trace
+
+# b12x patch: re-export attention wrappers (FI 0.6.11 moved them to submodules)
+try:
+    from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
+except ImportError:
+    pass
+try:
+    from flashinfer.prefill import (
+        BatchPrefillWithPagedKVCacheWrapper,
+        BatchPrefillWithRaggedKVCacheWrapper,
+    )
+except ImportError:
+    pass
+try:
+    from flashinfer.cascade import MultiLevelCascadeAttentionWrapper
+except ImportError:
+    pass
