@@ -22,6 +22,7 @@ import torch
 from ..api_logging import flashinfer_api
 from ..autotuner import (
     AutoTuner,
+    ConstraintSpec,
     DynamicTensorSpec,
     OptimizationProfile,
     TunableRunner,
@@ -39,7 +40,10 @@ from ..utils import register_custom_op, register_fake_op
 _ALGORITHM_AUTO = 0
 _ALGORITHM_MONOLITH = 1
 _ALGORITHM_TWO_KERNEL = 2
-_AUTOTUNE_CACHE_SCHEMA_VERSION = 2
+_AUTOTUNE_CACHE_SCHEMA_VERSION = 4
+# Public integration contract. Version 1 guarantees cache-capacity constraints
+# and batch-leading-stride normalization for native dynamic-bucket tuning.
+CHECKPOINTING_SSU_AUTOTUNE_ABI_VERSION = 1
 
 # A tactic is (algorithm, main pipeline stages, main CTAs/SM,
 # precompute heads/CTA).  Monolithic tactics ignore the latter three values.
@@ -126,6 +130,11 @@ def _initialize_state_batch_indices(
     return torch.arange(shape[0], dtype=dtype, device=device)
 
 
+def _cache_capacity_from_batch(shapes: tuple[tuple[int, ...], ...]) -> int:
+    """Profile only the active slots plus the reserved padding slot."""
+    return shapes[1][0] + 1
+
+
 def _clone_preserve_strides(tensor: torch.Tensor) -> torch.Tensor:
     clone = torch.empty_strided(
         tensor.size(), tensor.stride(), dtype=tensor.dtype, device=tensor.device
@@ -186,6 +195,7 @@ def _checkpointing_ssu_tuning_config(inputs: list[Any]) -> TuningConfig:
     """Describe the dense decode batch dimension to the FlashInfer tuner."""
     z, state_batch_indices, cu_seqlens = inputs[13], inputs[15], inputs[18]
     dynamic_specs: tuple[DynamicTensorSpec, ...] = ()
+    constraint_specs: tuple[ConstraintSpec, ...] = ()
     tensor_initializers: list[tuple[int, Any]] = []
 
     # Dense ReplaySSM has a single linked batch dimension.  Packed varlen calls
@@ -204,6 +214,17 @@ def _checkpointing_ssu_tuning_config(inputs: list[Any]) -> TuningConfig:
                 gen_tuning_buckets=get_hybrid_num_tokens_buckets,
                 map_to_tuning_buckets=map_to_hybrid_bucket_uncapped,
             ),
+        )
+        cache_capacity_inputs = [0, 7, 8, 9, 10, 11]
+        if inputs[16] is not None:
+            cache_capacity_inputs.append(16)
+        constraint_specs = tuple(
+            ConstraintSpec(
+                input_idx=index,
+                dim_idx=0,
+                infer_shape=_cache_capacity_from_batch,
+            )
+            for index in cache_capacity_inputs
         )
         tensor_initializers.extend(
             (
@@ -250,6 +271,7 @@ def _checkpointing_ssu_tuning_config(inputs: list[Any]) -> TuningConfig:
 
     return TuningConfig(
         dynamic_tensor_specs=dynamic_specs,
+        constraint_specs=constraint_specs,
         tensor_initializers=tuple(tensor_initializers),
         use_cold_l2_cache=True,
         use_cuda_graph=True,
@@ -284,6 +306,22 @@ class CheckpointingSSURunner(TunableRunner):
         self._main_ctas_per_sm = main_ctas_per_sm
         self._tactics = _make_tactics(heads_per_group)
 
+    def __hash__(self) -> int:
+        """Return a stable key for separately constructed equivalent runners."""
+        return hash(
+            (
+                self._module_base_args,
+                self._dt_softplus,
+                self._pad_slot_id,
+                self._requested_algorithm,
+                self._requested_d_split,
+                self._precompute_heads_per_cta,
+                self._main_pipeline_stages,
+                self._main_ctas_per_sm,
+                tuple(self._tactics),
+            )
+        )
+
     @staticmethod
     def _batch(inputs: list[Any]) -> int:
         cu_seqlens = inputs[18]
@@ -313,9 +351,32 @@ class CheckpointingSSURunner(TunableRunner):
         return list(self._tactics)
 
     def get_cache_key_extras(self, inputs: list[torch.Tensor]) -> tuple[Any, ...]:
+        # Every tensor below has a dynamic batch or constrained cache-capacity
+        # leading dimension. torch.compile may pad that leading stride without
+        # changing the kernel-visible inner layout, and profiles synthesized at
+        # another bucket necessarily have a different leading stride. Keep all
+        # inner strides in the tactic key while normalizing that dimension.
         stride_signature = tuple(
-            None if inputs[index] is None else tuple(inputs[index].stride())
-            for index in (1, 2, 4, 5, 6, 13, 15, 19, 20, 21)
+            None if inputs[index] is None else tuple(inputs[index].stride()[1:])
+            for index in (
+                0,
+                1,
+                2,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                13,
+                15,
+                16,
+                19,
+                20,
+                21,
+            )
         )
         return (
             _AUTOTUNE_CACHE_SCHEMA_VERSION,

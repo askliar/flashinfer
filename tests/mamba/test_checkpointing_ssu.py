@@ -610,9 +610,10 @@ def test_autotune_cache_hit_matches_tuning_call(tmp_path, T):
     """Profiling must not mutate live recurrent state before the selected call.
 
     The first call profiles every runtime tactic and saves its winner.  The
-    second starts from identical tensors, reloads the file cache, and executes
-    only that winner.  Matching postconditions prove the tuning fixture used
-    private state/caches and that the serialized compound tactic is replayed.
+    second uses a larger cache capacity, reloads the file cache, and executes
+    only that winner. Matching postconditions prove the tuning fixture used
+    private state/caches, cache capacity is not part of tactic identity, and
+    the serialized compound tactic is replayed.
     T=1 covers single-token prediction and T=6 covers an MTP-shaped call.
     """
     device = "cuda"
@@ -671,50 +672,83 @@ def test_autotune_cache_hit_matches_tuning_call(tmp_path, T):
     )
     k_old = ((max_window + 7) // 8) * 8
 
-    def _inputs():
-        state = state0.clone()
-        x_cache = x_cache0.clone()
-        B_cache = B_cache0.clone()
-        dt_cache = dt_cache0.clone()
-        out = torch.empty_like(x)
+    def _with_capacity(tensor, run_cache_size, leading_pad):
+        result = torch.empty_strided(
+            (run_cache_size, *tensor.shape[1:]),
+            (tensor.stride(0) + leading_pad, *tensor.stride()[1:]),
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
+        result.zero_()
+        result[:cache_size].copy_(tensor)
+        return result
+
+    def _with_leading_pad(tensor, leading_pad):
+        result = torch.empty_strided(
+            tensor.shape,
+            (tensor.stride(0) + leading_pad, *tensor.stride()[1:]),
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
+        result.copy_(tensor)
+        return result
+
+    def _inputs(run_cache_size=cache_size, leading_pad=0):
+        state = _with_capacity(state0, run_cache_size, leading_pad)
+        x_cache = _with_capacity(x_cache0, run_cache_size, leading_pad)
+        B_cache = _with_capacity(B_cache0, run_cache_size, leading_pad)
+        dt_cache = _with_capacity(dt_cache0, run_cache_size, leading_pad)
+        ring_start = torch.zeros(run_cache_size, dtype=torch.int32, device=device)
+        ring_start[:cache_size].copy_(ring_start0)
+        prev = torch.zeros_like(ring_start)
+        prev[:cache_size].copy_(prev0)
+        out = _with_leading_pad(torch.empty_like(x), leading_pad)
+        padded_dt_base = _with_leading_pad(dt_base, leading_pad)
         checkpointing_ssu_args = (
             state,
             x_cache,
             B_cache,
             dt_cache,
-            ring_start0.clone(),
-            prev0.clone(),
+            ring_start,
+            prev,
         )
         checkpointing_ssu_kwargs = dict(
-            x=x.clone(),
-            dt=dt_base.clone().unsqueeze(-1).expand(batch, T, nheads, head_dim),
+            x=_with_leading_pad(x, leading_pad),
+            dt=padded_dt_base.unsqueeze(-1).expand(batch, T, nheads, head_dim),
             A=A,
-            B=B.clone(),
-            C=C.clone(),
+            B=_with_leading_pad(B, leading_pad),
+            C=_with_leading_pad(C, leading_pad),
             out=out,
             D=D,
             dt_bias=dt_bias,
             dt_softplus=True,
             state_batch_indices=state_batch_indices.clone(),
             pad_slot_id=0,
-            cb_scaled=torch.empty(
-                batch,
-                nheads,
-                WARP_SIZE,
-                MMA_FRAG_SIZE,
-                dtype=act_dtype,
-                device=device,
+            cb_scaled=_with_leading_pad(
+                torch.empty(
+                    batch,
+                    nheads,
+                    WARP_SIZE,
+                    MMA_FRAG_SIZE,
+                    dtype=act_dtype,
+                    device=device,
+                ),
+                leading_pad,
             ),
-            cumAdt_vec=torch.empty(
-                batch, nheads, 16, dtype=torch.float32, device=device
+            cumAdt_vec=_with_leading_pad(
+                torch.empty(batch, nheads, 16, dtype=torch.float32, device=device),
+                leading_pad,
             ),
-            cb_old=torch.empty(
-                batch,
-                nheads,
-                WARP_SIZE,
-                k_old // 2,
-                dtype=act_dtype,
-                device=device,
+            cb_old=_with_leading_pad(
+                torch.empty(
+                    batch,
+                    nheads,
+                    WARP_SIZE,
+                    k_old // 2,
+                    dtype=act_dtype,
+                    device=device,
+                ),
+                leading_pad,
             ),
             algorithm="auto",
         )
@@ -724,7 +758,7 @@ def test_autotune_cache_hit_matches_tuning_call(tmp_path, T):
     tuner.clear_cache()
     cache_path = tmp_path / "checkpointing_ssu_autotune.json"
     tuned_args, tuned_kwargs = _inputs()
-    warm_args, warm_kwargs = _inputs()
+    warm_args, warm_kwargs = _inputs(cache_size + 4, leading_pad=256)
     with autotune(True, cache=str(cache_path), tuning_buckets=(batch,)):
         checkpointing_ssu(*tuned_args, **tuned_kwargs)
         checkpointing_ssu(*warm_args, **warm_kwargs)
@@ -735,21 +769,25 @@ def test_autotune_cache_hit_matches_tuning_call(tmp_path, T):
     assert isinstance(selected_tactic, tuple) and len(selected_tactic) == 4
 
     for tuned, warm in zip(tuned_args[:4], warm_args[:4], strict=True):
-        torch.testing.assert_close(warm, tuned, rtol=2e-2, atol=5e-1)
+        torch.testing.assert_close(warm[:cache_size], tuned, rtol=2e-2, atol=5e-1)
     torch.testing.assert_close(
         warm_kwargs["out"], tuned_kwargs["out"], rtol=2e-2, atol=5e-1
     )
 
     tuner.clear_cache()
-    cached_args, cached_kwargs = _inputs()
+    cached_args, cached_kwargs = _inputs(cache_size + 8, leading_pad=512)
     with autotune(False, cache=str(cache_path), tuning_buckets=(batch,)):
         checkpointing_ssu(*cached_args, **cached_kwargs)
 
     for tuned, cached in zip(tuned_args[:4], cached_args[:4], strict=True):
-        torch.testing.assert_close(cached, tuned, rtol=2e-2, atol=5e-1)
+        torch.testing.assert_close(cached[:cache_size], tuned, rtol=2e-2, atol=5e-1)
     torch.testing.assert_close(
         cached_kwargs["out"], tuned_kwargs["out"], rtol=2e-2, atol=5e-1
     )
+    assert (
+        "checkpointing_ssu",
+        "CheckpointingSSURunner",
+    ) in tuner._logged_file_hits
 
 
 def test_two_kernel_d_split2():
