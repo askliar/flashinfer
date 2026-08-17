@@ -9,6 +9,28 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+# Pin the preinstalled CUDA torch for every job-time pip install (same guard as
+# test_utils.sh; idempotent — whichever is sourced first wins). Prevents a dep's
+# transitive constraints from making pip re-resolve torch and silently evict the
+# CUDA build (on aarch64 pip backtracks to the CPU-only PyPI wheel -> "Torch not
+# compiled with CUDA enabled"); with the constraint such a resolution fails
+# loudly at install time. The +cuXXX local tag is stripped: PEP 440 lets the
+# installed 2.X.Y+cuNNN satisfy ==2.X.Y, but PEP-517 build envs (flashinfer-
+# jit-cache's build-system.requires includes torch) inherit PIP_CONSTRAINT and
+# must be able to resolve the pin from PyPI, where local-version wheels don't
+# exist.
+if [ -z "${PIP_CONSTRAINT:-}" ]; then
+  _torch_pin=$(python -c "import torch; print('torch=='+torch.__version__.split('+')[0])" 2>/dev/null || true)
+  if [ -n "${_torch_pin}" ]; then
+    _constraint_file=$(mktemp /tmp/ci-torch-constraint.XXXXXX.txt)
+    echo "${_torch_pin}" > "${_constraint_file}"
+    export PIP_CONSTRAINT="${_constraint_file}"
+    echo "Pinning for all pip installs in this job: ${_torch_pin}"
+    unset _constraint_file
+  fi
+  unset _torch_pin
+fi
+
 # Source the environment override file if it exists
 if [ -f "${REPO_ROOT}/ci/setup_python.env" ]; then
   source "${REPO_ROOT}/ci/setup_python.env"
@@ -21,6 +43,22 @@ if [ -n "${TVM_FFI_REF:-}" ]; then
   echo "========================================"
   pip install --force-reinstall "git+https://github.com/apache/tvm-ffi.git@${TVM_FFI_REF}"
   echo "TVM-FFI override complete."
+  echo ""
+fi
+
+# Install quack-kernels for the VSA blk128 backend tests.
+# quack-kernels is NOT a runtime requirement of flashinfer — only users of the
+# blk128 VSA backend need it, so it is intentionally kept out of requirements.txt
+# and installed here for CI only. The blk128 backend supports SM100/SM103, so we
+# install quack-kernels only when such a GPU is present to avoid slowing unrelated CI jobs.
+# The correct PyPI distribution name is quack-kernels (top-level package: quack).
+SM_MAJOR=$(python -c "import torch; print(torch.cuda.get_device_capability()[0])" 2>/dev/null || echo "")
+if [ "${SM_MAJOR}" = "10" ]; then
+  echo "========================================"
+  echo "Detected SM${SM_MAJOR} (SM100/SM103); installing quack-kernels for VSA blk128 tests"
+  echo "========================================"
+  pip install "quack-kernels==0.6.4"
+  echo "quack-kernels install complete."
   echo ""
 fi
 

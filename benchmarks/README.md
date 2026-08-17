@@ -2,10 +2,16 @@
 
 The aim of `flashinfer_benchmark.py` is to provide a single framework for benchmarking any FlashInfer kernel and replace standalone benchmarking scripts.
 
+`bench_recurrent_kda_prefill.py --case-set h12` runs the six Kimi-K3 TP8 H12
+public-API cases. `reduce_kda_h12.py` combines successful SM100a and SM103a
+result files without producing a cross-shape aggregate. The benchmark defaults
+to the natural device/shape dispatcher and records its resolved module; use
+`--candidate-route nonpersistent` for a B200 direct-family route A/B.
+
 ## Overview
 
 This framework provides tools to:
-- Benchmark FlashInfer's Attention, GEMM, MOE, Norm, Quantization, Sampling, RoPE, Mamba, and GDN API performance from different kernel backends such as FlashAttention2/3, cuDNN, cuBLAS, CUTLASS, CuTe-DSL, TensorRT-LLM, and Triton
+- Benchmark FlashInfer's Attention, GEMM, MOE, Norm, Quantization, Sampling, RoPE, Mamba, and GDN API performance from different kernel backends such as FlashAttention2/3, cuDNN, cuBLAS, CUTLASS, PrimTS, CuTe-DSL, TensorRT-LLM, and Triton
 - Compare performance across different configurations
 - Batch performance test multiple test cases
 
@@ -20,10 +26,13 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
         - Also supports computationally similar `cudnn_batch_prefill_with_kv_cache` (cudnn-native) and  `trtllm_ragged_attention_deepseek`.
     - `BatchMLAPagedAttentionWrapper` - MLA attention proposed in DeepSeek series of models.
         - Also supports computationally similar `trtllm_batch_decode_with_kv_cache_mla` (trtllm-native) and CuTe DSL MLA decode kernel (cute-dsl, SM100+).
+    - All four attention routines accept `--backends prims-ts` on SM100/SM103 to benchmark the experimental task-scheduled attention implementation. `prims_ts` is accepted as an alias.
 - GEMM:
     - `gemm_fp8_nt_groupwise` - GEMM with FP8 data types using groupwise scaling.
     - `group_gemm_fp8_nt_groupwise` - Group GEMM with FP8 data types using groupwise scaling.
     - `bmm_fp8` - Batched matrix multiplication with FP8 inputs.
+    - `mm_mxfp8` - Dense MXFP8 matrix multiplication.
+    - `mm_fp8` - Matrix multiplication with FP8 inputs using the trtllm-gen low-latency GEMM (Blackwell SM10.0+, small-M optimized, pre-shuffled weights).
     - `mm_fp4` - Matrix multiplication with NVFP4 inputs.
     - `mm_bf16` - Matrix multiplication with BF16 inputs (Blackwell SM10.0+).
     - `bmm_bf16` - Batched matrix multiplication with BF16 inputs (Blackwell SM10.0+).
@@ -198,7 +207,7 @@ The output CSV will contain detailed metrics including:
 | `--verbose`, `-v`        | Print additional information (can be used multiple times for more verbosity, e.g. `-vv`)                   |
 | `--case_tag`              | Optional tag for the test case, useful for annotating or filtering results in the output CSV.              |
 | `--generate_repro_command`| If set, prints a reproducer command for the test case and stores it in the output CSV.                     |
-| `--backends`             | Space-separated list of backends to test, e.g. fa2, fa2_tc, fa3, auto, cudnn, cudnn-native, cutlass, trtllm, trtllm-gen, trtllm-native, cute-dsl, cublas. (`auto` currently supported for `BatchDecodeWithPagedKVCacheWrapper` and `BatchPrefillWithPagedKVCacheWrapper`.)|
+| `--backends`             | Space-separated list of backends to test, e.g. fa2, fa2_tc, fa3, auto, cudnn, cudnn-native, cutlass, trtllm, trtllm-gen, trtllm-native, prims-ts, cute-dsl, cublas, trtllm_low_latency. (`prims_ts` aliases `prims-ts`; `auto` support is routine-dependent.)|
 
 ### Attention Flags
 | Flag                     | Description                                                                                                 |
@@ -209,14 +218,14 @@ The output CSV will contain detailed metrics including:
 | `--s_kv`                 | Key/value sequence length (context length)                                                                  |
 | `--num_qo_heads`         | Number of query/output attention heads                                                                      |
 | `--num_kv_heads`         | Number of key/value attention heads                                                                         |
-| `--head_dim_qk`          | Head dimension for Q/K. Must be 128 or 192.                                                                |
+| `--head_dim_qk`          | Head dimension for Q/K. Backend-dependent; PrimTS supports 64/128/256 for FMHA decode and 128/256 for FMHA context. |
 | `--head_dim_vo`          | Head dimension for V/O. Usually equals head_dim_qk.                                                        |
 | `--head_dim_ckv`         | Head dimension for C/K/V (MLA attention).                                                                  |
 | `--head_dim_kpe`         | Head dimension for KPE (MLA attention).                                                                    |
-| `--q_dtype`              | Data type for the query tensor. Default: bfloat16. Supports bfloat16, fp8_e4m3, fp8_e5m2.                  |
-| `--kv_dtype`             | Data type for the key and value tensors. Default: bfloat16. Supports bfloat16, fp8_e4m3, fp8_e5m2.         |
-| `--out_dtype`            | Data type for the output tensor. Default: same as q_dtype. Supports bfloat16, float16. Required when q_dtype is FP8. |
-| `--causal`               | Use causal attention masking (prefill only)                                                                |
+| `--q_dtype`              | Data type for the query tensor. Default: bfloat16. Supports float16, bfloat16, fp8_e4m3, and fp8_e5m2 where the selected backend permits them. |
+| `--kv_dtype`             | Data type for the key and value tensors. Default: bfloat16. Supports float16, bfloat16, fp8_e4m3, and fp8_e5m2 where the selected backend permits them. |
+| `--out_dtype`            | Data type for the output tensor. Default: same as q_dtype. Backend-dependent; PrimTS context accepts bfloat16, float16, or fp8_e4m3, while PrimTS FP8 decode accepts float16 or fp8_e4m3. FP8 ragged comparisons with non-PrimTS backends require bfloat16 or float16. |
+| `--causal`               | Use causal attention masking for context/prefill. Multi-query FMHA and MLA decode use bottom-right causal masking automatically. |
 | `--random_actual_seq_len`| Use random sequence lengths up to max length. If False, use max length.                                    |
 
 ### GEMM Flags
@@ -234,7 +243,7 @@ The output CSV will contain detailed metrics including:
 | `--mat2_dtype`           | Data type for second matrix (for FP8 GEMM, e.g. `fp8_e4m3`)                                                |
 | `--use_128x4_sf_layout`  | Use 128x4 scale/format layout for FP4 GEMM (for `mm_fp4` routine)                                          |
 | `--use_nvfp4`            | Whether to use nvfp4 quantization or mxfp4 quantization, defaults to False.(for `mm_fp4` routine)          |
-| `--autotune`             | Enable autotune for supported operation (`mm_fp4`, `bmm_fp8`, `mm_bf16`, `bmm_bf16` routines)              |
+| `--autotune`             | Enable autotune for supported operation (`mm_fp4`, `bmm_fp8`, `mm_fp8`, `bmm_mxfp8`, `mm_mxfp8`, `mm_bf16`, `bmm_bf16` routines) |
 | `--bias`                 | Use bias for `mm_bf16` (Enabled for TGV backend)                                                           |
 
 ### MOE Flags
@@ -298,6 +307,7 @@ The `moe_a2a_dispatch_combine` routine benchmarks MoE All-to-All communication f
 | `--validate`             | Run correctness validation before benchmarking using deterministic fake MoE                                |
 | `--per_phase_timing`     | Enable per-phase timing (dispatch/combine/moe_kernel). Adds slight overhead from CUDA events               |
 | `--nvtx`                 | Enable NVTX markers for Nsight Systems profiling                                                           |
+| `--use_lora`             | Carry a per-token int32 LoRA adapter ID through dispatch as an extra payload.                                                                                                                  |
 
 **Launch Examples:**
 ```bash
@@ -323,6 +333,12 @@ mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
     --routine moe_a2a_dispatch_combine \
     --num_tokens 1024 --hidden_size 7168 --num_experts 256 --top_k 8 \
     --validate --per_phase_timing
+
+# Multi-tenant LoRA: carry per-token adapter ID through dispatch
+mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
+    --routine moe_a2a_dispatch_combine \
+    --num_tokens 2048 --hidden_size 7168 --num_experts 256 --top_k 8 \
+    --use_lora --validate
 ```
 
 ### AllReduce Communication Flags (allreduce_fusion)
@@ -390,7 +406,7 @@ mpirun -np 8 python benchmarks/flashinfer_benchmark.py \
 | `--enable_pdl`           | Enable programmatic dependent launch                                                                       |
 | `--batch_size`           | Batch size for batched quantization (`nvfp4_batched_quantize` only)                                        |
 | `--global_scale`         | Global scale factor for NVFP4 quantization. Default: 1.0                                                   |
-| `--sf_layout`            | Scale factor layout for NVFP4: `128x4` (default), `8x4`, or `linear`                                       |
+| `--sf_layout`            | Scale factor layout for FP4 quantization: `128x4` (default), `8x4`, or `linear`                             |
 | `--do_shuffle`           | Shuffle scale factors for TRTLLM backend (`nvfp4_quantize` only)                                           |
 | `--sf_vec_size`          | Scale factor vector size for NVFP4 quantization. Default: 16                                               |
 | `--backends`             | Backend to test. Default: `cuda`                                                                           |
@@ -490,16 +506,18 @@ Legend:
 - trtllm: TensorRT-LLM
 - trtllm-gen: TensorRT-LLM (generic wrapper)
 - trtllm-native: TensorRT-LLM (native API)
+- prims-ts: Experimental task-scheduled attention (SM100/SM103)
 -->
 | Routine | 7.5 | 8.0 | 8.6 | 8.9 | 9.0 | 10.0 | 10.3 | 12.0 |
 |---------|-----|-----|-----|-----|-----|-------|-------|-------|
-| **BatchDecodeWithPagedKVCacheWrapper** | fa2 | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn, trtllm-gen, trtllm-native | fa2, fa2_tc, cudnn, trtllm-gen, trtllm-native | fa2, fa2_tc, cudnn |
-| **BatchPrefillWithPagedKVCacheWrapper** |  | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, fa3, cudnn, cudnn-native | fa2, cudnn, cudnn-native, trtllm-gen, trtllm-native | fa2, cudnn, cudnn-native, trtllm-gen, trtllm-native | fa2, cudnn, cudnn-native |
-| **BatchPrefillWithRaggedKVCacheWrapper** |  | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, fa3, cudnn, cudnn-native | fa2, cudnn, cudnn-native, cutlass, trtllm-native | fa2, cudnn, cudnn-native, cutlass, trtllm-native | fa2, cudnn, cudnn-native |
-| **BatchMLAPagedAttentionWrapper** |  | fa2 | fa2 | fa2 | fa2, fa3 | fa2, cutlass, trtllm-native, cute-dsl | fa2, cutlass, trtllm-native | fa2 |
+| **BatchDecodeWithPagedKVCacheWrapper** | fa2 | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn, trtllm-gen, trtllm-native, prims-ts | fa2, fa2_tc, cudnn, trtllm-gen, trtllm-native, prims-ts | fa2, fa2_tc, cudnn |
+| **BatchPrefillWithPagedKVCacheWrapper** |  | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, fa3, cudnn, cudnn-native | fa2, cudnn, cudnn-native, trtllm-gen, trtllm-native, prims-ts | fa2, cudnn, cudnn-native, trtllm-gen, trtllm-native, prims-ts | fa2, cudnn, cudnn-native |
+| **BatchPrefillWithRaggedKVCacheWrapper** |  | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, fa3, cudnn, cudnn-native | fa2, cudnn, cudnn-native, cutlass, trtllm-native, prims-ts | fa2, cudnn, cudnn-native, cutlass, trtllm-native, prims-ts | fa2, cudnn, cudnn-native |
+| **BatchMLAPagedAttentionWrapper** |  | fa2 | fa2 | fa2 | fa2, fa3 | fa2, cutlass, trtllm-native, cute-dsl, prims-ts | fa2, cutlass, trtllm-native, prims-ts | fa2 |
 | **gemm_fp8_nt_groupwise** |  |  |  |  |  | cutlass | cutlass |  |
 | **group_gemm_fp8_nt_groupwise** |  |  |  |  |  | cutlass | cutlass |  |
 | **bmm_fp8** |  |  |  | cudnn, cublas | cudnn, cublas | cudnn, cublas, cutlass | cudnn, cublas, cutlass | cudnn, cublas |
+| **mm_fp8** |  |  |  |  |  | trtllm_low_latency | trtllm_low_latency |  |
 | **mm_fp4** |  |  |  |  |  | cudnn, trtllm, cutlass | cudnn, trtllm, cutlass | cudnn |
 | **mm_bf16** |  |  |  |  |  | cudnn, cutlass, tgv | cudnn, cutlass, tgv |  |
 | **bmm_bf16** |  |  |  |  |  | cudnn, cutlass | cudnn, cutlass |  |
@@ -561,6 +579,7 @@ Backend Legend:
 - trtllm: TensorRT-LLM
 - trtllm-gen: TensorRT-LLM
 - trtllm-native: TensorRT-LLM (out-of-wrapper)
+- prims-ts: Experimental task-scheduled attention kernels (Blackwell SM100/SM103)
 - cuda: FlashInfer CUDA kernels
 - cute-dsl: FlashInfer CuTe-DSL kernels (Blackwell SM10.0+)
 - moe_a2a: MoE All-to-All communication (requires mpirun, Blackwell SM10.0+ with MNNVL)

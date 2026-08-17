@@ -18,7 +18,12 @@ from .packbits import packbits, segment_packbits
 from ..jit.quantization import gen_quantization_module
 
 # Re-export FP8 quantization
-from .fp8_quantization import mxfp8_quantize, mxfp8_dequantize_host
+from .fp8_quantization import (
+    mxfp8_quantize,
+    mxfp8_grouped_quantize,
+    mxfp8_dequantize_host,
+    per_token_group_quant_8bit,
+)
 
 # Re-export FP4 quantization (all public symbols)
 from .fp4_quantization import (
@@ -35,9 +40,11 @@ from .fp4_quantization import (
     nvfp4_quantize_paged_kv_cache,
     nvfp4_kv_quantize,
     nvfp4_kv_dequantize,
+    nvfp4_kv_dequantize_paged,
     shuffle_matrix_a,
     shuffle_matrix_sf_a,
     scaled_fp4_grouped_quantize,
+    silu_and_mul_nvfp4_quantize,
     get_fp4_quantization_module,  # Used by activation.py
 )
 
@@ -68,7 +75,9 @@ __all__ = [
     "gen_quantization_module",
     # FP8
     "mxfp8_quantize",
+    "mxfp8_grouped_quantize",
     "mxfp8_dequantize_host",
+    "per_token_group_quant_8bit",
     # FP4
     "SfLayout",
     "block_scale_interleave",
@@ -83,9 +92,11 @@ __all__ = [
     "nvfp4_quantize_paged_kv_cache",
     "nvfp4_kv_quantize",
     "nvfp4_kv_dequantize",
+    "nvfp4_kv_dequantize_paged",
     "shuffle_matrix_a",
     "shuffle_matrix_sf_a",
     "scaled_fp4_grouped_quantize",
+    "silu_and_mul_nvfp4_quantize",
     "get_fp4_quantization_module",
 ]
 
